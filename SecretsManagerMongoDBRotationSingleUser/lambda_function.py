@@ -152,10 +152,10 @@ def set_secret(service_client, arn, token):
     pending_dict = get_secret_dict(service_client, arn, "AWSPENDING", token)
 
     # First try to login with the pending secret, if it succeeds, return
-    conn = get_connection(pending_dict)
-    if conn:
-        conn.logout()
+    client, conn = get_connection(pending_dict)
+    if conn is not None:
         logger.info("setSecret: AWSPENDING secret is already set as password in MongoDB for secret arn %s." % arn)
+        client.close()
         return
 
     # Make sure the user from current and pending match
@@ -169,27 +169,36 @@ def set_secret(service_client, arn, token):
         raise ValueError("Attempting to modify user for host %s other than current host %s" % (pending_dict['host'], current_dict['host']))
 
     # Now try the current password
-    conn = get_connection(current_dict)
+    client, conn = get_connection(current_dict)
 
     # If both current and pending do not work, try previous
-    if not conn and previous_dict:
+    if conn is None and previous_dict:
+        # Close current client if it exists
+        if client is not None:
+            client.close()
         # Update previous_dict to leverage current SSL settings
         previous_dict.pop('ssl', None)
         if 'ssl' in current_dict:
             previous_dict['ssl'] = current_dict['ssl']
 
-        conn = get_connection(previous_dict)
+        client, conn = get_connection(previous_dict)
 
         # Make sure the user/host from previous and pending match
         if previous_dict['username'] != pending_dict['username']:
+            if client is not None:
+                client.close()
             logger.error("setSecret: Attempting to modify user %s other than previous valid user %s" % (pending_dict['username'], previous_dict['username']))
             raise ValueError("Attempting to modify user %s other than previous valid user %s" % (pending_dict['username'], previous_dict['username']))
         if previous_dict['host'] != pending_dict['host']:
+            if client is not None:
+                client.close()
             logger.error("setSecret: Attempting to modify user for host %s other than previous host %s" % (pending_dict['host'], previous_dict['host']))
             raise ValueError("Attempting to modify user for host %s other than previous host %s" % (pending_dict['host'], previous_dict['host']))
 
     # If we still don't have a connection, raise a ValueError
-    if not conn:
+    if conn is None:
+        if client is not None:
+            client.close()
         logger.error("setSecret: Unable to log into database with previous, current, or pending secret of secret arn %s" % arn)
         raise ValueError("Unable to log into database with previous, current, or pending secret of secret arn %s" % arn)
 
@@ -201,7 +210,9 @@ def set_secret(service_client, arn, token):
         logger.error("setSecret: Error encountered when attempting to set password in database for user %s", pending_dict['username'])
         raise ValueError("Error encountered when attempting to set password in database for user %s", pending_dict['username'])
     finally:
-        conn.logout()
+        # Always close the client
+        if client is not None:
+            client.close()
 
 
 def test_secret(service_client, arn, token):
@@ -227,20 +238,22 @@ def test_secret(service_client, arn, token):
     """
     # Try to login with the pending secret, if it succeeds, return
     pending_dict = get_secret_dict(service_client, arn, "AWSPENDING", token)
-    conn = get_connection(pending_dict)
-    if conn:
-        # This is where the lambda will validate the user's permissions. Uncomment/modify the below lines to
-        # tailor these validations to your needs
-        try:
+    client, conn = get_connection(pending_dict)
+    try:
+        if conn is not None:
+            # This is where the lambda will validate the user's permissions. Uncomment/modify the below lines to
+            # tailor these validations to your needs
             conn.command('usersInfo', pending_dict['username'])
-        finally:
-            conn.logout()
 
-        logger.info("testSecret: Successfully signed into MongoDB with AWSPENDING secret in %s." % arn)
-        return
-    else:
-        logger.error("testSecret: Unable to log into database with pending secret of secret ARN %s" % arn)
-        raise ValueError("Unable to log into database with pending secret of secret ARN %s" % arn)
+            logger.info("testSecret: Successfully signed into MongoDB with AWSPENDING secret in %s." % arn)
+            return
+        else:
+            logger.error("testSecret: Unable to log into database with pending secret of secret ARN %s" % arn)
+            raise ValueError("Unable to log into database with pending secret of secret ARN %s" % arn)
+    finally:
+        # Always close the client
+        if client is not None:
+            client.close()
 
 
 def finish_secret(service_client, arn, token):
@@ -284,7 +297,7 @@ def get_connection(secret_dict):
         secret_dict (dict): The Secret Dictionary
 
     Returns:
-        Connection: The pymongo.database.Database object if successful. None otherwise
+        Tuple: (client, db) - The pymongo.MongoClient and pymongo.database.Database objects if successful. (None, None) otherwise
 
     Raises:
         KeyError: If the secret json does not contain the expected keys
@@ -298,10 +311,13 @@ def get_connection(secret_dict):
     use_ssl, fall_back = get_ssl_config(secret_dict)
 
     # if an 'ssl' key is not found or does not contain a valid value, attempt an SSL connection and fall back to non-SSL on failure
-    conn = connect_and_authenticate(secret_dict, port, dbname, use_ssl)
-    if conn or not fall_back:
-        return conn
+    client, conn = connect_and_authenticate(secret_dict, port, dbname, use_ssl)
+    if conn is not None or not fall_back:
+        return client, conn
     else:
+        # Close the first client if connection failed but client was created
+        if client is not None:
+            client.close()
         return connect_and_authenticate(secret_dict, port, dbname, False)
 
 
@@ -351,7 +367,7 @@ def connect_and_authenticate(secret_dict, port, dbname, use_ssl):
     """Attempt to connect and authenticate to a MongoDB instance
 
     This helper function tries to connect to the database using connectivity info passed in.
-    If successful, it returns the connection, else None
+    If successful, it returns the client and database objects, else None, None
 
     Args:
         - secret_dict (dict): The Secret Dictionary
@@ -360,7 +376,7 @@ def connect_and_authenticate(secret_dict, port, dbname, use_ssl):
         - use_ssl (bool): Flag indicating whether connection should use SSL/TLS
 
     Returns:
-        Connection: The pymongo.database.Database object if successful. None otherwise
+        Tuple: (client, db) - The pymongo.MongoClient and pymongo.database.Database objects if successful. (None, None) otherwise
 
     Raises:
         KeyError: If the secret json does not contain the expected keys
@@ -369,17 +385,17 @@ def connect_and_authenticate(secret_dict, port, dbname, use_ssl):
     # Try to obtain a connection to the db
     try:
         # Hostname verfification and server certificate validation enabled by default when ssl=True
-        client = MongoClient(host=secret_dict['host'], port=port, connectTimeoutMS=5000, serverSelectionTimeoutMS=5000, ssl=use_ssl)
+        client = MongoClient(host=secret_dict['host'], port=port, username=secret_dict['username'], password=secret_dict['password'], authSource=dbname, connectTimeoutMS=5000, serverSelectionTimeoutMS=5000, tls=use_ssl)
         db = client[dbname]
-        db.authenticate(secret_dict['username'], secret_dict['password'])
+        db.command('ping')
         logger.info("Successfully established %s connection as user '%s' with host: '%s'" % ("SSL/TLS" if use_ssl else "non SSL/TLS", secret_dict['username'], secret_dict['host']))
-        return db
+        return client, db
     except errors.PyMongoError as e:
         if 'SSL handshake failed' in e.args[0]:
             logger.error("Unable to establish SSL/TLS handshake, check that SSL/TLS is enabled on the host: %s" % secret_dict['host'])
         elif re.search("hostname '.+' doesn't match", e.args[0]):
             logger.error("Hostname verification failed when estlablishing SSL/TLS Handshake with host: %s" % secret_dict['host'])
-        return None
+        return None, None
 
 
 def get_secret_dict(service_client, arn, stage, token=None):

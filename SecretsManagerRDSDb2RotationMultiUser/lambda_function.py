@@ -1,10 +1,12 @@
 # Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
+import time
 
 import boto3
 import json
 import logging
 import os
+import traceback
 import ibm_db
 
 logger = logging.getLogger()
@@ -80,6 +82,9 @@ def lambda_handler(event, context):
         set_secret(service_client, arn, token)
 
     elif step == "testSecret":
+        # Wait for 10s to allow propagation of the newly set AWSPENDING password as the user password in the database.
+        # The database user password change is asynchronous.
+        time.sleep(10)
         test_secret(service_client, arn, token)
 
     elif step == "finishSecret":
@@ -214,8 +219,8 @@ def set_secret(service_client, arn, token):
         if not "Username %s already exists" % pending_dict['username'] in str(e):
             ibm_db.close(admin_conn)
             ibm_db.close(db_conn)
-            logger.error("setSecret: Unable to create user %s" % pending_dict['username'])
-            raise ValueError("Unable to create user %s" % pending_dict['username'])
+            logger.error("setSecret: Unable to create user %s due to %s" % (pending_dict['username'], traceback.format_exc()))
+            raise ValueError("Unable to create user %s" % pending_dict['username']) from e
 
     # Copy permissions
     perm_to_cmd_map = {
@@ -636,7 +641,7 @@ def get_random_password(service_client):
         string: The randomly generated password.
     """
     passwd = service_client.get_random_password(
-        ExcludeCharacters=os.environ.get('EXCLUDE_CHARACTERS', '/@"\'\\;'),
+        ExcludeCharacters=os.environ.get('EXCLUDE_CHARACTERS', '/@"\'\\;,*!-?&|[]{}^()'),
         PasswordLength=int(os.environ.get('PASSWORD_LENGTH', 32)),
         ExcludeNumbers=get_environment_bool('EXCLUDE_NUMBERS', False),
         ExcludePunctuation=get_environment_bool('EXCLUDE_PUNCTUATION', False),
